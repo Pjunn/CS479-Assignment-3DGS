@@ -141,7 +141,7 @@ class GSRasterizer(object):
 
         p_view = homogene_points @ w2c # N 4
         p_proj = p_view @ proj_mat # N 4
-        p_ndc = p_proj / p_proj[:, -1] 
+        p_ndc = p_proj / p_proj[:, -1].unsqueeze(-1)
 
         # TODO: Cull points that are close or behind the camera
         in_mask = p_ndc[:, 2] > z_near
@@ -189,7 +189,8 @@ class GSRasterizer(object):
         # TODO: Compute Jacobian of view transform and projection
         J[:, 0, 0] = f_x
         J[:, 1, 1] = f_y
-        cov_2d = J @ W.T @ cov_3d @ W @ J.T
+        W = W.unsqueeze(0)
+        cov_2d = J @ W.transpose(1,2) @ cov_3d @ W @ J.transpose(1,2)
         # ========================================================
 
         # add low pass filter here according to E.q. 32
@@ -243,22 +244,28 @@ class GSRasterizer(object):
                 
                 # ========================================================
                 # TODO: Compute the displacement vector from the 2D mean coordinates to the pixel coordinates
-                displacement = torch.tensor([w, h]) - c_mean_2d[argsort_c_depths] # N 2
+                tile_pixels = []
+                for i in range(self.tile_size):
+                    for j in range(self.tile_size):
+                        tile_pixels.append([w+i, h+j])
+
+                displacement = torch.tensor(tile_pixels).unsqueeze(1).to(mean_2d.device) - c_mean_2d[argsort_c_depths].unsqueeze(0) # T^2 N 2
+                displacement = displacement.unsqueeze(-1)
                 # ========================================================
 
                 # ========================================================
                 # TODO: Compute the Gaussian weight for each pixel in the tile
-                gaussian_weight = torch.exp(- 1/2 * displacement.T @ c_cov_2d[argsort_c_depths].inverse() @ displacement)
+                gaussian_weight = torch.exp(- 1/2 * displacement.transpose(2,3) @ c_cov_2d[argsort_c_depths].inverse() @ displacement).squeeze(-1)
                 # ========================================================
 
                 # ========================================================
                 # TODO: Perform alpha blending
                 alpha = gaussian_weight * c_opacities[argsort_c_depths]
                 transparency = torch.cat([
-                    torch.tensor([1]).unsqueeze(-1),
-                    torch.cumprod((1 - alpha)[:-1])])
+                    torch.ones_like(alpha[:, 0]).unsqueeze(-1).to(mean_2d.device),
+                    torch.cumprod((1 - alpha)[:, :-1], dim=1)], dim=1)
                     
-                tile_color = torch.sum(c_color[argsort_c_depths] * alpha * transparency)
+                tile_color = torch.sum(c_color[argsort_c_depths] * alpha * transparency, 1)
                 # ========================================================
 
                 render_color[h:h+self.tile_size, w:w+self.tile_size] = tile_color.reshape(self.tile_size, self.tile_size, -1)
