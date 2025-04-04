@@ -141,10 +141,11 @@ class GSRasterizer(object):
 
         p_view = homogene_points @ w2c # N 4
         p_proj = p_view @ proj_mat # N 4
-        p_ndc = p_proj / p_proj[:, -1].unsqueeze(-1)
+        p_w = 1.0 / (p_proj[..., -1:] + 0.000001) # N 1
+        p_ndc = p_proj * p_w
 
         # TODO: Cull points that are close or behind the camera
-        in_mask = p_ndc[:, 2] > z_near
+        in_mask = p_view[:, 2] >= z_near
         # ========================================================
 
         return p_ndc, p_view, in_mask
@@ -187,10 +188,16 @@ class GSRasterizer(object):
         W = w2c[:3, :3].T
         # ========================================================
         # TODO: Compute Jacobian of view transform and projection
-        J[:, 0, 0] = f_x
-        J[:, 1, 1] = f_y
-        W = W.unsqueeze(0)
-        cov_2d = J @ W.transpose(1,2) @ cov_3d @ W @ J.transpose(1,2)
+        t = (mean_3d @ w2c[:3, :3]) + w2c[-1:, :3] # N 3
+        t_x = t[..., 0]
+        t_y = t[..., 1]
+        t_z = t[..., 2]
+        J[:, 0, 0] = f_x / t_z
+        J[:, 0, 2] = - f_x * t_x / t_z**2
+        J[:, 1, 1] = f_y / t_z
+        J[:, 1, 2] = - f_y * t_y / t_z**2
+
+        cov_2d = J @ W @ cov_3d @ W.T @ J.transpose(1,2)
         # ========================================================
 
         # add low pass filter here according to E.q. 32
@@ -233,39 +240,40 @@ class GSRasterizer(object):
 
                 # ========================================================
                 # TODO: Sort the projected Gaussians that lie in the current tile by their depths, in ascending order
-                c_mean_2d = mean_2d[in_mask]
-                c_cov_2d = cov_2d[in_mask]
-                c_color = color[in_mask]
-                c_opacities = opacities[in_mask]
-                c_depths = depths[in_mask]
 
-                argsort_c_depths = c_depths.argsort()
+                sorted_depths, index = torch.sort(depths[in_mask])
+                sorted_mean_2d = mean_2d[in_mask][index]
+                sorted_cov_2d = cov_2d[in_mask][index]
+                sorted_covin = sorted_cov_2d.inverse()
+                sorted_color = color[in_mask][index]
+                sorted_opacities = opacities[in_mask][index]
+                
+
+                
                 # ========================================================
                 
                 # ========================================================
                 # TODO: Compute the displacement vector from the 2D mean coordinates to the pixel coordinates
-                tile_pixels = []
-                for i in range(self.tile_size):
-                    for j in range(self.tile_size):
-                        tile_pixels.append([w+i, h+j])
+                tile_pixels = pix_coord[h:h+self.tile_size, w:w+self.tile_size].flatten(0, 1) # T^2 2
 
-                displacement = torch.tensor(tile_pixels).unsqueeze(1).to(mean_2d.device) - c_mean_2d[argsort_c_depths].unsqueeze(0) # T^2 N 2
+                displacement = tile_pixels.unsqueeze(1) - sorted_mean_2d.unsqueeze(0) # T^2 N 2
                 displacement = displacement.unsqueeze(-1)
                 # ========================================================
 
                 # ========================================================
                 # TODO: Compute the Gaussian weight for each pixel in the tile
-                gaussian_weight = torch.exp(- 1/2 * displacement.transpose(2,3) @ c_cov_2d[argsort_c_depths].inverse() @ displacement).squeeze(-1)
+                gaussian_weight = torch.exp(- 1/2 * displacement.transpose(2,3) @ sorted_covin @ displacement).squeeze(-1) # T^2 N 1
                 # ========================================================
 
                 # ========================================================
                 # TODO: Perform alpha blending
-                alpha = gaussian_weight * c_opacities[argsort_c_depths]
+                alpha = (gaussian_weight * sorted_opacities).clip(max=0.99) # Max alpha is 1
                 transparency = torch.cat([
                     torch.ones_like(alpha[:, 0]).unsqueeze(-1).to(mean_2d.device),
                     torch.cumprod((1 - alpha)[:, :-1], dim=1)], dim=1)
-                    
-                tile_color = torch.sum(c_color[argsort_c_depths] * alpha * transparency, 1)
+                
+                acc_alpha = (alpha * transparency).sum(dim=1)
+                tile_color = torch.sum(sorted_color.unsqueeze(0) * alpha * transparency, 1) + (1-acc_alpha) * (1)
                 # ========================================================
 
                 render_color[h:h+self.tile_size, w:w+self.tile_size] = tile_color.reshape(self.tile_size, self.tile_size, -1)
